@@ -1,7 +1,7 @@
 // Simulation: the match state machine. One place holds the score, the
 // round clock, the economy, the spike and every actor, and one fixed-step
 // function advances it. Rendering never writes here; it only reads.
-import { ECONOMY, ROUND, WEAPONS, GRENADE } from './config.js';
+import { ECONOMY, ROUND, WEAPONS, GRENADE, SPIKE } from './config.js';
 import { createPlayer, createBot, updatePlayer, updateBot, botCanSee, applyDamage } from './actors.js';
 import { tryFirePlayer, startReload, finishReload, resolveBotShot, updateGrenades, throwGrenadeAtPoint } from './combat.js';
 import { randRange } from './util.js';
@@ -24,7 +24,10 @@ export function createGameState(scene, world, audio, effects, viewModel, rng) {
     roundTimer: ROUND.roundTime,
     freezeTimer: 0,
     roundReason: '',
-    spike: { planted: false, defused: false, x: 0, z: 0, site: null, timer: 0, beepTimer: 0, defuser: null },
+    // The spike starts on the player's back. `dropped` marks it lying on
+    // the ground after a carrier died; `carrier` is the ally bot carrying
+    // it, or null when the player (or nobody) has it.
+    spike: { planted: false, defused: false, dropped: false, carrier: null, pickupTimer: 0, x: 0, z: 0, site: null, timer: 0, beepTimer: 0, defuser: null },
     feed: [],
     hitmarker: null,
     damageFlash: -10,
@@ -88,13 +91,15 @@ function placeActors(state) {
     bot.defusing = 0;
     bot.burstLeft = 0;
     bot.burstPause = 0;
+    bot.hasSpike = false; // nobody carries into a new round but the player
+    bot.planting = 0;
     bot.mesh.rotation.x = 0;
     bot.mesh.position.set(spawn.x, 0, spawn.z);
     bot.mesh.rotation.y = spawn.yaw;
     bot.waypoint = Math.floor(rng() * world.waypoints.length);
     bot.waitTimer = 0;
   }
-  state.spike = { planted: false, defused: false, x: 0, z: 0, site: null, timer: 0, beepTimer: 0, defuser: null };
+  state.spike = { planted: false, defused: false, dropped: false, carrier: null, pickupTimer: 0, x: 0, z: 0, site: null, timer: 0, beepTimer: 0, defuser: null };
   state.grenades.forEach((g) => state.scene.remove(g.mesh));
   state.grenades.length = 0;
 }
@@ -149,7 +154,34 @@ function startBuyPhase(state) {
 function startRound(state) {
   state.roundPhase = 'live';
   state.roundTimer = ROUND.roundTime;
+  state.audio.roundStart();
   state.feed.push({ text: 'Round started — plant the spike at A or B', kind: 'info', t: state.time });
+}
+
+// A carrier died: the spike drops where they fell instead of vanishing
+// with them. Until someone walks over it, the round can only be won by
+// elimination — which is exactly the failure the old build had permanently.
+function dropSpike(state, carrier) {
+  const angle = state.rng() * Math.PI * 2;
+  const scatter = state.rng() * SPIKE.dropScatter;
+  carrier.hasSpike = false;
+  state.spike.dropped = true;
+  state.spike.carrier = null;
+  state.spike.x = carrier.pos.x + Math.cos(angle) * scatter;
+  state.spike.z = carrier.pos.z + Math.sin(angle) * scatter;
+  state.spike.pickupTimer = 0;
+  state.feed.push({ text: `${carrier.name} dropped the spike`, kind: 'info', t: state.time });
+  state.audio.spikeDrop();
+}
+
+// Carriers die in several places (bot shots, grenades); one sweep per step
+// catches them all instead of wiring a drop into every damage path.
+function checkSpikeDrops(state) {
+  const player = state.player;
+  if (!player.alive && player.hasSpike) dropSpike(state, player);
+  for (const bot of state.bots) {
+    if (bot.team === 'ally' && !bot.alive && bot.hasSpike) dropSpike(state, bot);
+  }
 }
 
 function endRound(state, winner, reason) {
@@ -264,7 +296,7 @@ export function stepGame(state, input, dt) {
   // Player movement and actions.
   if (player.alive) {
     const stepped = updatePlayer(player, input, dt, state.world);
-    if (stepped) state.audio.step();
+    if (stepped) state.audio.step(input.sprint && input.f);
     if (input.fireHeld) {
       const res = tryFirePlayer(state, state.rng);
       if (res.fired) {
@@ -284,7 +316,7 @@ export function stepGame(state, input, dt) {
           state.audio.plantBeep();
         }
         if (player.planting >= ROUND.plantTime) {
-          state.spike = { planted: true, defused: false, x: site.x, z: site.z, site: site.id, timer: ROUND.detonateTime, beepTimer: 0, defuser: null };
+          state.spike = { planted: true, defused: false, dropped: false, carrier: null, pickupTimer: 0, x: site.x, z: site.z, site: site.id, timer: ROUND.detonateTime, beepTimer: 0, defuser: null };
           player.hasSpike = false;
           player.planting = 0;
           player.money = Math.min(ECONOMY.maxMoney, player.money + ECONOMY.plantReward);
@@ -294,6 +326,25 @@ export function stepGame(state, input, dt) {
         }
       } else {
         player.planting = Math.max(0, player.planting - dt * 2);
+      }
+    }
+    // Picking up a dropped spike: stand on it briefly and it is yours
+    // again. The short channel stops the spike flickering between carriers
+    // when two teammates cross the same spot.
+    if (state.spike.dropped && player.alive) {
+      const d = Math.hypot(state.spike.x - player.pos.x, state.spike.z - player.pos.z);
+      if (d < SPIKE.pickupRadius) {
+        state.spike.pickupTimer += dt;
+        if (state.spike.pickupTimer >= SPIKE.pickupDelay) {
+          player.hasSpike = true;
+          state.spike.dropped = false;
+          state.spike.carrier = null;
+          state.spike.pickupTimer = 0;
+          state.feed.push({ text: 'You picked up the spike', kind: 'info', t: state.time });
+          state.audio.spikePickup();
+        }
+      } else {
+        state.spike.pickupTimer = 0;
       }
     }
   }
@@ -336,6 +387,9 @@ export function stepGame(state, input, dt) {
     }
   }
   updateGrenades(state, dt);
+
+  // A carrier may have died to a bot shot or a grenade this step.
+  checkSpikeDrops(state);
 
   // Round end conditions.
   const enemiesAlive = state.bots.some((b) => b.team === 'enemy' && b.alive);

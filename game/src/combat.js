@@ -241,7 +241,7 @@ export function tryFirePlayer(state, rng) {
     const dmg = weapon.damage * (best.head ? weapon.headMult : 1) * falloff;
     applyDamage(bestActor, dmg, best.head, player, state);
     state.hitmarker = { t: state.time, kill: !bestActor.alive, head: best.head };
-    state.audio.hit();
+    state.audio.hit(best.head);
     if (!bestActor.alive) state.audio.kill();
     state.effects.sparks(end, best.head ? 0xff5a3c : 0xffd27a, best.head ? 14 : 8);
     return { fired: true, hit: true, kill: !bestActor.alive, head: best.head };
@@ -308,7 +308,7 @@ export function resolveBotShot(state, shot, rng) {
   const end = { x: bot.pos.x + dir.x * endT, y: eyeY + dir.y * endT, z: bot.pos.z + dir.z * endT };
   state.effects.tracer(from, end);
   state.effects.flash(from, 14);
-  if (d < 40) state.audio.distantShot();
+  if (d < 40) state.audio.distantShot(d);
   if (bestActor) {
     const falloff = clamp(1 - (best.t / 60) * 0.4, 0.6, 1);
     const dmg = bot.damage * (best.head ? 2 : 1) * falloff;
@@ -343,12 +343,15 @@ function launchGrenade(state, owner, dir) {
     owner,
     mesh,
   });
-  state.audio.shot('smg');
+  state.audio.grenadeThrow();
 }
 
 export function throwGrenade(state, owner) {
   if (owner.isPlayer && state.player.grenades <= 0) return false;
-  if (owner.isPlayer) state.player.grenades -= 1;
+  if (owner.isPlayer) {
+    state.player.grenades -= 1;
+    state.audio.grenadePin();
+  }
   const yaw = owner.yaw;
   const pitch = owner.pitch ?? 0;
   launchGrenade(state, owner, {

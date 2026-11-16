@@ -1,5 +1,9 @@
 // Small math helpers shared by the simulation. No allocations in the hot
 // paths: callers reuse the scratch vectors exported here.
+//
+// Round 2 added the helpers the spike flow and the new HUD needed — 2D
+// distances, easing for the HUD bars, a seeded shuffle for bot variety —
+// without touching the signatures the rest of the game already relies on.
 
 // Deterministic RNG so a ?seed= URL replays the same bot layout and patrols.
 export function mulberry32(seed) {
@@ -17,8 +21,18 @@ export function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+export function clamp01(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
 export function lerp(a, b, t) {
   return a + (b - a) * t;
+}
+
+// Frame-rate independent lerp: `rate` is how fast the value closes the gap
+// per second, `dt` the step. Used for camera FOV and view-model blends.
+export function damp(a, b, rate, dt) {
+  return lerp(a, b, 1 - Math.exp(-rate * dt));
 }
 
 export function randRange(rng, lo, hi) {
@@ -29,6 +43,63 @@ export function pick(rng, arr) {
   return arr[Math.floor(rng() * arr.length)];
 }
 
+// Fisher–Yates with the seeded RNG, so a shuffle replays with ?seed=.
+export function shuffle(rng, arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// --- 2D helpers: the simulation lives on the XZ plane -----------------------
+export function dist2D(ax, az, bx, bz) {
+  return Math.hypot(ax - bx, az - bz);
+}
+
+export function dist2DSq(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return dx * dx + dz * dz;
+}
+
+// True when (x, z) is inside the circle — the spike pickup, plant sites and
+// grenade splash all test this.
+export function isInCircle(x, z, cx, cz, radius) {
+  return dist2DSq(x, z, cx, cz) < radius * radius;
+}
+
+// Move `v` toward `target` by at most `maxDelta`; returns the new value.
+// Used for smooth bar fills and the spike pickup channel.
+export function moveToward(v, target, maxDelta) {
+  if (Math.abs(target - v) <= maxDelta) return target;
+  return v + Math.sign(target - v) * maxDelta;
+}
+
+// A random unit direction on the XZ plane, for scatter and spawn jitter.
+export function randomUnit2D(rng, out) {
+  const a = rng() * Math.PI * 2;
+  out.x = Math.cos(a);
+  out.z = Math.sin(a);
+  return out;
+}
+
+// --- easing -----------------------------------------------------------------
+export function smoothstep(edge0, edge1, x) {
+  const t = clamp01((x - edge0) / (edge1 - edge0));
+  return t * t * (3 - 2 * t);
+}
+
+export function easeOutCubic(t) {
+  return 1 - (1 - clamp01(t)) ** 3;
+}
+
+export function easeInOutQuad(t) {
+  const x = clamp01(t);
+  return x < 0.5 ? 2 * x * x : 1 - (-2 * x + 2) ** 2 / 2;
+}
+
+// --- angles -----------------------------------------------------------------
 // Angle helpers: yaw is rotation around Y, 0 facing -Z.
 export function yawToDir(yaw, out) {
   out.x = -Math.sin(yaw);
@@ -43,6 +114,27 @@ export function angleDiff(a, b) {
   return d;
 }
 
+// Shortest-path turn toward `target` at most `maxStep` radians.
+export function angleLerp(a, target, maxStep) {
+  return a + clamp(angleDiff(target, a), -maxStep, maxStep);
+}
+
+export function degToRad(d) {
+  return (d * Math.PI) / 180;
+}
+
+export function radToDeg(r) {
+  return (r * 180) / Math.PI;
+}
+
+// --- formatting -------------------------------------------------------------
+// "1:07" for the round clock; shared by the HUD and the buy menu.
+export function formatClock(seconds) {
+  const t = Math.max(0, Math.ceil(seconds));
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+}
+
+// --- collision --------------------------------------------------------------
 // Axis-aligned box collider: { minX, maxX, minZ, maxZ, top }.
 // Returns true when a circle of `radius` at (x, z) overlaps the box.
 export function circleHitsBox(x, z, radius, b) {

@@ -4,7 +4,7 @@
 // that walks the waypoint graph, hears gunfire and shoots back.
 import * as THREE from 'three';
 import { PALETTE } from './palette.js';
-import { ARENA, PLAYER, BOTS, WEAPONS, ECONOMY, ROUND } from './config.js';
+import { ARENA, PLAYER, BOTS, WEAPONS, ECONOMY, ROUND, SPIKE } from './config.js';
 import { clamp, lerp, randRange, pick, angleDiff, resolveCircleBox } from './util.js';
 
 // --- shared hit testing ---------------------------------------------------
@@ -296,6 +296,8 @@ export function createBot(team, index, spawn, scene, rng) {
     strafeTimer: 0,
     holdSite: team === 'enemy' ? (index < 2 ? 'A' : 'B') : null,
     defusing: 0,
+    hasSpike: false, // an ally that picks up a dropped spike carries it to a site
+    planting: 0, // channel progress when an ally carrier plants the spike
     grenadeTimer: randRange(rng, 10, 20), // enemy bots lob a grenade now and then
     walkPhase: rng() * 6,
     damage: WEAPONS.carbine.damage * 0.8,
@@ -414,8 +416,50 @@ export function updateBot(bot, state, dt, rng) {
   }
   if (planted && bot.team === 'ally' && !bot.target) bot.state = 'hunt';
 
+  // An ally that walks over a dropped spike picks it up — the round is no
+  // longer stranded when the player dies carrying it.
+  if (state.spike.dropped && bot.team === 'ally' && bot.alive && !state.spike.planted) {
+    const d = Math.hypot(state.spike.x - bot.pos.x, state.spike.z - bot.pos.z);
+    if (d < SPIKE.pickupRadius) {
+      bot.hasSpike = true;
+      state.spike.dropped = false;
+      state.spike.carrier = bot;
+      state.feed.push({ text: `${bot.name} picked up the spike`, kind: 'info', t: state.time });
+      state.audio.spikePickup();
+    }
+  }
+
   // --- state machine -------------------------------------------------------
-  if (bot.target && bot.reaction > 0) {
+  // A spike carrier's job is the objective, not a duel: run to the nearest
+  // site and plant. Combat is suspended while carrying, so the carrier
+  // cannot get stuck trading shots in mid while the round clock runs out.
+  if (bot.hasSpike && !planted) {
+    const sites = Object.values(world.sites);
+    const site = sites.reduce((a, b) => {
+      const da = (a.x - bot.pos.x) ** 2 + (a.z - bot.pos.z) ** 2;
+      const db = (b.x - bot.pos.x) ** 2 + (b.z - bot.pos.z) ** 2;
+      return db < da ? b : a;
+    });
+    const d = Math.hypot(site.x - bot.pos.x, site.z - bot.pos.z);
+    if (d <= site.radius) {
+      bot.vel.x = 0;
+      bot.vel.z = 0;
+      bot.planting += dt;
+      if (Math.floor(bot.planting * 4) !== Math.floor((bot.planting - dt) * 4)) {
+        state.audio.plantBeep();
+      }
+      if (bot.planting >= SPIKE.allyPlantTime) {
+        state.spike = { ...state.spike, planted: true, defused: false, dropped: false, carrier: null, pickupTimer: 0, x: site.x, z: site.z, site: site.id, timer: ROUND.detonateTime, beepTimer: 0, defuser: null };
+        bot.hasSpike = false;
+        bot.planting = 0;
+        state.feed.push({ text: `${bot.name} planted the spike at Site ${site.id} — defend it`, kind: 'win', t: state.time });
+        state.audio.roundWin();
+      }
+    } else {
+      bot.planting = 0;
+      moveBotToward(bot, site.x, site.z, SPIKE.carrierSpeed, dt, world);
+    }
+  } else if (bot.target && bot.reaction > 0) {
     bot.reaction -= dt;
     bot.vel.x = 0;
     bot.vel.z = 0;

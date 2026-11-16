@@ -2,14 +2,10 @@
 // writes the DOM; it never writes back into the simulation except through
 // the callbacks main.js hands it (play, buy, restart).
 import { WEAPONS, GRENADE, ROUND } from './config.js';
+import { formatClock } from './util.js';
 
 function el(id) {
   return document.getElementById(id);
-}
-
-function fmtTime(s) {
-  const t = Math.max(0, Math.ceil(s));
-  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
 }
 
 export function createHud(state, callbacks) {
@@ -98,6 +94,22 @@ export function createHud(state, callbacks) {
       mctx.arc(sx(state.spike.x), sz(state.spike.z), 10 + Math.sin(state.time * 6) * 2, 0, Math.PI * 2);
       mctx.stroke();
     }
+    if (state.spike.dropped) {
+      // A dropped spike is an amber diamond, pulsing so it is findable at a
+      // glance — the minimap is how a player locates it across the yard.
+      const r = 6 + Math.sin(state.time * 6) * 2;
+      const dx = sx(state.spike.x);
+      const dz = sz(state.spike.z);
+      mctx.strokeStyle = '#f0a830';
+      mctx.lineWidth = 2;
+      mctx.beginPath();
+      mctx.moveTo(dx, dz - r);
+      mctx.lineTo(dx + r, dz);
+      mctx.lineTo(dx, dz + r);
+      mctx.lineTo(dx - r, dz);
+      mctx.closePath();
+      mctx.stroke();
+    }
     const dot = (x, z, color, r = 3) => {
       mctx.fillStyle = color;
       mctx.beginPath();
@@ -137,6 +149,7 @@ export function createHud(state, callbacks) {
     cache.lastPhase = phase;
 
     setText('health-value', String(Math.ceil(p.health)));
+    el('health-value').classList.toggle('low', p.health <= 30);
     setStyle('health-bar', 'width', `${Math.max(0, p.health)}%`);
     setText('armor-value', String(Math.ceil(p.armor)));
     setStyle('armor-bar', 'width', `${Math.max(0, p.armor * 2)}%`);
@@ -144,16 +157,16 @@ export function createHud(state, callbacks) {
     setText('score-value', `${state.score.us} — ${state.score.them}`);
     setText('round-value', `Round ${Math.min(state.round, ROUND.maxRounds)}/${ROUND.maxRounds}`);
     if (phase === 'buy') {
-      setText('timer-value', `BUY ${fmtTime(state.buyTimer)}`);
+      setText('timer-value', `BUY ${formatClock(state.buyTimer)}`);
       el('timer-value').classList.add('buy');
       el('timer-value').classList.remove('low');
     } else if (phase === 'live' && state.spike.planted) {
       // Once the spike is live the detonation clock is the one that matters.
-      setText('timer-value', `SPIKE ${fmtTime(state.spike.timer)}`);
+      setText('timer-value', `SPIKE ${formatClock(state.spike.timer)}`);
       el('timer-value').classList.remove('buy');
       el('timer-value').classList.toggle('low', state.spike.timer < 10);
     } else if (phase === 'live') {
-      setText('timer-value', fmtTime(state.roundTimer));
+      setText('timer-value', formatClock(state.roundTimer));
       el('timer-value').classList.toggle('low', state.roundTimer < 15);
       el('timer-value').classList.remove('buy');
     } else {
@@ -168,6 +181,11 @@ export function createHud(state, callbacks) {
     el('ammo').classList.toggle('empty', ammo.mag === 0);
     setText('weapon-name', weapon.name);
     setText('grenade-count', `G × ${p.grenades}`);
+    // The spike line always says who has the objective: you, an ally by
+    // name, nobody (dropped), or nobody any more (planted). Before this
+    // the line went blank while an ally carried it, which read as "lost".
+    const carrier = state.spike.carrier;
+    setText('spike-status', p.hasSpike ? '◆ Carrying the spike' : state.spike.planted ? '◆ Spike planted' : carrier ? `◆ ${carrier.name} carries the spike` : state.spike.dropped ? '◆ Spike dropped — find it' : '');
     setText('weapon-slots', p.weapons.map((id, i) => `${i + 1} ${WEAPONS[id].name.split(' ').pop()}`).join(' · '));
     // Crosshair spread follows the simulation's spread.
     const gap = 3 + p.spread * 260 + p.recoil * 30;
@@ -203,6 +221,27 @@ export function createHud(state, callbacks) {
       setText('plant-label', `Spike live — detonation in ${Math.ceil(state.spike.timer)}s`);
     } else {
       plant.hidden = true;
+    }
+    // Dropped-spike prompt: the player only needs it when the spike is on
+    // the ground and they are close enough to act on it; further away the
+    // minimap diamond does the job. An ally carrier gets its own line so
+    // the player knows to escort instead of hunting for the spike.
+    const prompt = el('spike-prompt');
+    if (phase === 'live' && state.spike.dropped && p.alive) {
+      const d = Math.hypot(state.spike.x - p.pos.x, state.spike.z - p.pos.z);
+      if (d < 12) {
+        prompt.hidden = false;
+        prompt.classList.remove('ally');
+        setText('spike-prompt', 'Spike dropped — walk over it to pick it up');
+      } else {
+        prompt.hidden = true;
+      }
+    } else if (phase === 'live' && state.spike.carrier && !state.spike.planted) {
+      prompt.hidden = false;
+      prompt.classList.add('ally');
+      setText('spike-prompt', `${state.spike.carrier.name} carries the spike — escort them to a site`);
+    } else {
+      prompt.hidden = true;
     }
     // Kill feed.
     const feed = el('feed');

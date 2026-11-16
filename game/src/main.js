@@ -4,15 +4,19 @@
 // `?shot=start|play|buy|end&seed=N` stages the game for screenshots without
 // a pointer lock: the same code path renders them, nothing is faked.
 import * as THREE from 'three';
-import { PALETTE } from './palette.js';
-import { ARENA, WEAPONS, ROUND } from './config.js';
+import { PALETTE, applyTheme } from './palette.js';
+import { ARENA, WEAPONS, ROUND, AUDIO } from './config.js';
 import { mulberry32, clamp, lerp } from './util.js';
 import { buildWorld } from './world.js';
 import { createAudio } from './audio.js';
 import { createGameState, startMatch, spawnBots, buyWeapon, buyGrenade, buyAmmo, stepGame } from './sim.js';
 import { createViewModel, createEffects, updateViewModel, setViewModelWeapon, throwGrenade } from './combat.js';
-import { createInput } from './input.js';
+import { createInput, prettyKey } from './input.js';
 import { createHud } from './hud.js';
+
+// The palette owns the CSS theme: push it into the document before the
+// first frame so the HUD and the 3D scene can never drift apart.
+applyTheme();
 
 const STEP = 1 / 60;
 const params = new URLSearchParams(window.location.search);
@@ -37,6 +41,24 @@ const world = buildWorld(scene, rng);
 const audio = createAudio();
 const effects = createEffects(scene);
 const viewModel = createViewModel(camera);
+
+// Dropped-spike marker: a spinning amber octahedron on a pulsing ring, so
+// a spike on the ground is visible across the yard without opening the map.
+const spikeMarker = new THREE.Group();
+const spikeCore = new THREE.Mesh(
+  new THREE.OctahedronGeometry(0.22),
+  new THREE.MeshStandardMaterial({ color: PALETTE.spike, emissive: PALETTE.spike, emissiveIntensity: 0.9, roughness: 0.3, metalness: 0.6 }),
+);
+spikeCore.position.y = 0.35;
+const spikeRing = new THREE.Mesh(
+  new THREE.RingGeometry(0.5, 0.62, 32),
+  new THREE.MeshBasicMaterial({ color: PALETTE.spikeGlow, transparent: true, opacity: 0.7, side: THREE.DoubleSide }),
+);
+spikeRing.rotation.x = -Math.PI / 2;
+spikeRing.position.y = 0.03;
+spikeMarker.add(spikeCore, spikeRing);
+spikeMarker.visible = false;
+scene.add(spikeMarker);
 const state = createGameState(scene, world, audio, effects, viewModel, rng);
 spawnBots(state);
 
@@ -75,16 +97,16 @@ const hud = createHud(state, {
   },
   onBuyWeapon(id) {
     const res = buyWeapon(state, id);
-    if (!res.ok) flashBuyNote(res.why);
+    if (!res.ok) { flashBuyNote(res.why); audio.buyFail(); }
     else setViewModelWeapon(viewModel, id); // buying equips it at once
   },
   onBuyGrenade() {
     const res = buyGrenade(state);
-    if (!res.ok) flashBuyNote(res.why);
+    if (!res.ok) { flashBuyNote(res.why); audio.buyFail(); }
   },
   onBuyAmmo() {
     const res = buyAmmo(state);
-    if (!res.ok) flashBuyNote(res.why);
+    if (!res.ok) { flashBuyNote(res.why); audio.buyFail(); }
   },
   onCloseBuy() {
     hud.closeBuy();
@@ -99,6 +121,58 @@ function flashBuyNote(text) {
   clearTimeout(flashBuyNote._t);
   flashBuyNote._t = setTimeout(() => n.classList.remove('show'), 1600);
 }
+
+// --- settings panel (start screen) ------------------------------------------
+// Sensitivity, mute and crouch toggle are one-liners; the key bindings list
+// is rebuilt from input.js so it always shows the live mapping.
+const sensInput = document.getElementById('sensitivity');
+const sensOut = document.getElementById('sensitivity-value');
+if (sensInput) {
+  sensInput.value = String(inputCtl.sensitivity());
+  if (sensOut) sensOut.textContent = inputCtl.sensitivity().toFixed(1);
+  sensInput.addEventListener('input', () => {
+    inputCtl.setSensitivity(Number(sensInput.value));
+    if (sensOut) sensOut.textContent = inputCtl.sensitivity().toFixed(1);
+  });
+}
+const muteToggle = document.getElementById('mute-toggle');
+if (muteToggle) muteToggle.addEventListener('change', () => audio.setMuted(muteToggle.checked));
+const crouchToggle = document.getElementById('crouch-toggle');
+if (crouchToggle) {
+  crouchToggle.checked = inputCtl.crouchToggle();
+  crouchToggle.addEventListener('change', () => inputCtl.setCrouchToggle(crouchToggle.checked));
+}
+const bindingsList = document.getElementById('bindings-list');
+function renderBindings() {
+  if (!bindingsList) return;
+  bindingsList.innerHTML = '';
+  for (const b of inputCtl.listBindings()) {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = b.keys.map(prettyKey).join(' / ') || '—';
+    btn.addEventListener('click', () => {
+      btn.textContent = 'press a key…';
+      btn.classList.add('listening');
+      const once = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        window.removeEventListener('keydown', once, true);
+        if (e.code !== 'Escape') inputCtl.rebind(b.id, e.code);
+        renderBindings();
+      };
+      window.addEventListener('keydown', once, true);
+    });
+    li.append(`${b.label}: `, btn);
+    bindingsList.appendChild(li);
+  }
+}
+renderBindings();
+const resetBindings = document.getElementById('reset-bindings');
+if (resetBindings) resetBindings.addEventListener('click', () => {
+  inputCtl.resetBindings();
+  renderBindings();
+});
 
 // Clicking the yard locks the pointer so mouse-look and firing work. Clicks
 // on the buy menu never reach the canvas (the menu sits above it), so the
@@ -206,13 +280,24 @@ function frame(now) {
   const frameDt = Math.min(0.1, (now - last) / 1000);
   last = now;
 
-  // Mouse look applies every frame, not per step.
+  // Mouse look applies every frame, not per step. Sensitivity comes from
+  // the settings panel (default 1.0, persisted per browser).
   const look = inputCtl.consumeLook();
-  const sens = input.ads ? 0.0013 : 0.0023;
+  const sens = (input.ads ? 0.0013 : 0.0023) * inputCtl.sensitivity();
   state.player.yaw -= look.dx * sens;
   state.player.pitch = clamp(state.player.pitch - look.dy * sens, -1.45, 1.45);
 
-  // Weapon switching and grenades are frame-level actions.
+  // Weapon switching and grenades are frame-level actions. The wheel sets
+  // switchTo to -2 (next) or -3 (previous); digits set a slot index.
+  if (input.switchTo === -2 || input.switchTo === -3) {
+    const dir = input.switchTo === -2 ? 1 : -1;
+    const n = state.player.weapons.length;
+    state.player.weaponIndex = (state.player.weaponIndex + dir + n) % n;
+    state.player.reloading = false;
+    state.player.reloadTimer = 0;
+    setViewModelWeapon(viewModel, state.player.weapons[state.player.weaponIndex]);
+    input.switchTo = -1;
+  }
   if (input.switchTo >= 0 && input.switchTo < state.player.weapons.length) {
     state.player.weaponIndex = input.switchTo;
     state.player.reloading = false;
@@ -264,6 +349,19 @@ function frame(now) {
   }
   viewModel.group.visible = started && p.alive && shot !== 'start' && shot !== 'end';
   updateViewModel(viewModel, p, frameDt, Math.hypot(p.vel.x, p.vel.z), input.ads);
+
+  // Dropped-spike marker follows the spike; it spins and bobs so it reads
+  // as an objective, not scenery.
+  spikeMarker.visible = state.spike.dropped && state.roundPhase === 'live';
+  if (state.spike.dropped) {
+    spikeMarker.position.set(state.spike.x, 0, state.spike.z);
+    spikeCore.rotation.y += frameDt * 2;
+    spikeCore.position.y = 0.35 + Math.sin(state.time * 3) * 0.08;
+    spikeRing.material.opacity = 0.45 + Math.sin(state.time * 4) * 0.2;
+  }
+
+  // Low-health heartbeat: a slow thump under the threshold in config.js.
+  if (started && p.alive && p.health <= AUDIO.lowHealthThreshold) audio.heartbeat(state.time);
 
   // Nudge the player to click the yard when a round is live but the mouse
   // is not locked yet (e.g. right after the buy phase ends).
